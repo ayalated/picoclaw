@@ -755,6 +755,39 @@ func (m *Manager) GetChannel(name string) (Channel, bool) {
 	return channel, ok
 }
 
+// PeekPlaceholderID returns the current placeholder message id for a channel/chat
+// pair without consuming it. The placeholder remains available for final preSend.
+func (m *Manager) PeekPlaceholderID(channel, chatID string) (string, bool) {
+	key := channel + ":" + chatID
+	v, ok := m.placeholders.Load(key)
+	if !ok {
+		return "", false
+	}
+	entry, ok := v.(placeholderEntry)
+	if !ok || entry.id == "" {
+		return "", false
+	}
+	return entry.id, true
+}
+
+// EditPlaceholder edits an existing placeholder (if present) using the channel's
+// MessageEditor capability. It does not remove the placeholder registration.
+func (m *Manager) EditPlaceholder(ctx context.Context, channel, chatID, content string) error {
+	placeholderID, ok := m.PeekPlaceholderID(channel, chatID)
+	if !ok {
+		return nil
+	}
+	ch, ok := m.GetChannel(channel)
+	if !ok {
+		return nil
+	}
+	editor, ok := ch.(MessageEditor)
+	if !ok {
+		return nil
+	}
+	return editor.EditMessage(ctx, chatID, placeholderID, content)
+}
+
 func (m *Manager) GetStatus() map[string]any {
 	m.mu.RLock()
 	defer m.mu.RUnlock()

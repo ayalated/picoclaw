@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/mymmrac/telego"
@@ -23,6 +24,11 @@ import (
 	"github.com/sipeed/picoclaw/pkg/logger"
 	"github.com/sipeed/picoclaw/pkg/media"
 	"github.com/sipeed/picoclaw/pkg/utils"
+)
+
+const (
+	telegramMaxMessageLength = 4096
+	telegramEditInterval     = 800 * time.Millisecond
 )
 
 var (
@@ -47,6 +53,8 @@ type TelegramChannel struct {
 	chatIDs  map[string]int64
 	ctx      context.Context
 	cancel   context.CancelFunc
+	animMu   sync.Mutex
+	animStop map[string]context.CancelFunc
 }
 
 func NewTelegramChannel(cfg *config.Config, bus *bus.MessageBus) (*TelegramChannel, error) {
@@ -97,6 +105,7 @@ func NewTelegramChannel(cfg *config.Config, bus *bus.MessageBus) (*TelegramChann
 		bot:         bot,
 		config:      cfg,
 		chatIDs:     make(map[string]int64),
+		animStop:    make(map[string]context.CancelFunc),
 	}, nil
 }
 
@@ -164,6 +173,13 @@ func (c *TelegramChannel) Start(ctx context.Context) error {
 func (c *TelegramChannel) Stop(ctx context.Context) error {
 	logger.InfoC("telegram", "Stopping Telegram bot...")
 	c.SetRunning(false)
+
+	c.animMu.Lock()
+	for key, stop := range c.animStop {
+		stop()
+		delete(c.animStop, key)
+	}
+	c.animMu.Unlock()
 
 	// Stop the bot handler
 	if c.bh != nil {
@@ -284,6 +300,8 @@ func (c *TelegramChannel) StartTyping(ctx context.Context, chatID string) (func(
 
 // EditMessage implements channels.MessageEditor.
 func (c *TelegramChannel) EditMessage(ctx context.Context, chatID string, messageID string, content string) error {
+	c.stopPlaceholderAnimation(chatID, messageID)
+
 	cid, err := parseChatID(chatID)
 	if err != nil {
 		return err
@@ -292,9 +310,26 @@ func (c *TelegramChannel) EditMessage(ctx context.Context, chatID string, messag
 	if err != nil {
 		return err
 	}
+
+	content = truncateRunes(content, telegramMaxMessageLength)
+	return c.editTelegramMessage(ctx, cid, mid, content)
+}
+
+func (c *TelegramChannel) editTelegramMessage(ctx context.Context, chatID int64, messageID int, content string) error {
 	htmlContent := markdownToTelegramHTML(content)
-	editMsg := tu.EditMessageText(tu.ID(cid), mid, htmlContent)
+	editMsg := tu.EditMessageText(tu.ID(chatID), messageID, htmlContent)
 	editMsg.ParseMode = telego.ModeHTML
+	_, err := c.bot.EditMessageText(ctx, editMsg)
+	if err == nil {
+		return nil
+	}
+
+	logger.ErrorCF("telegram", "HTML parse failed on message edit, falling back to plain text", map[string]any{
+		"error": err.Error(),
+	})
+
+	editMsg = tu.EditMessageText(tu.ID(chatID), messageID, content)
+	editMsg.ParseMode = ""
 	_, err = c.bot.EditMessageText(ctx, editMsg)
 	return err
 }
@@ -310,7 +345,7 @@ func (c *TelegramChannel) SendPlaceholder(ctx context.Context, chatID string) (s
 
 	text := phCfg.Text
 	if text == "" {
-		text = "Thinking... 💭"
+		text = "🤔 Thinking..."
 	}
 
 	cid, err := parseChatID(chatID)
@@ -323,7 +358,71 @@ func (c *TelegramChannel) SendPlaceholder(ctx context.Context, chatID string) (s
 		return "", err
 	}
 
-	return fmt.Sprintf("%d", pMsg.MessageID), nil
+	msgID := fmt.Sprintf("%d", pMsg.MessageID)
+	c.startPlaceholderAnimation(chatID, msgID, text)
+
+	return msgID, nil
+}
+
+func (c *TelegramChannel) startPlaceholderAnimation(chatID, messageID, baseText string) {
+	if baseText == "" {
+		baseText = "🤔 Thinking..."
+	}
+
+	animKey := chatID + ":" + messageID
+	animCtx, cancel := context.WithCancel(c.ctx)
+
+	c.animMu.Lock()
+	if prev, ok := c.animStop[animKey]; ok {
+		prev()
+	}
+	c.animStop[animKey] = cancel
+	c.animMu.Unlock()
+
+	go func() {
+		ticker := time.NewTicker(telegramEditInterval)
+		defer ticker.Stop()
+
+		cid, err := parseChatID(chatID)
+		if err != nil {
+			return
+		}
+		mid, err := strconv.Atoi(messageID)
+		if err != nil {
+			return
+		}
+
+		phases := []string{baseText, baseText + ".", baseText + "..", baseText + "..."}
+		i := 0
+
+		for {
+			select {
+			case <-animCtx.Done():
+				return
+			case <-ticker.C:
+				i = (i + 1) % len(phases)
+				if err := c.editTelegramMessage(animCtx, cid, mid, phases[i]); err != nil {
+					logger.DebugCF("telegram", "Placeholder animation edit failed", map[string]any{
+						"chat_id":    chatID,
+						"message_id": messageID,
+						"error":      err.Error(),
+					})
+				}
+			}
+		}
+	}()
+}
+
+func (c *TelegramChannel) stopPlaceholderAnimation(chatID, messageID string) {
+	animKey := chatID + ":" + messageID
+
+	c.animMu.Lock()
+	defer c.animMu.Unlock()
+
+	if stop, ok := c.animStop[animKey]; ok {
+		stop()
+		delete(c.animStop, animKey)
+	}
 }
 
 // SendMedia implements the channels.MediaSender interface.
@@ -612,6 +711,17 @@ func parseChatID(chatIDStr string) (int64, error) {
 	var id int64
 	_, err := fmt.Sscanf(chatIDStr, "%d", &id)
 	return id, err
+}
+
+func truncateRunes(s string, n int) string {
+	if n <= 0 || s == "" {
+		return ""
+	}
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n])
 }
 
 func markdownToTelegramHTML(text string) string {

@@ -58,6 +58,17 @@ func NewCodexProviderWithTokenSource(
 func (p *CodexProvider) Chat(
 	ctx context.Context, messages []Message, tools []ToolDefinition, model string, options map[string]any,
 ) (*LLMResponse, error) {
+	return p.ChatStream(ctx, messages, tools, model, options, nil)
+}
+
+func (p *CodexProvider) ChatStream(
+	ctx context.Context,
+	messages []Message,
+	tools []ToolDefinition,
+	model string,
+	options map[string]any,
+	onDelta StreamHandler,
+) (*LLMResponse, error) {
 	var opts []option.RequestOption
 	accountID := p.accountID
 	resolvedModel, fallbackReason := resolveCodexModel(model)
@@ -103,6 +114,12 @@ func (p *CodexProvider) Chat(
 	var resp *responses.Response
 	for stream.Next() {
 		evt := stream.Current()
+		if onDelta != nil {
+			if evt.Type == "response.output_text.delta" {
+				deltaEvt := evt.AsResponseOutputTextDelta()
+				onDelta(deltaEvt.Delta)
+			}
+		}
 		if evt.Type == "response.completed" || evt.Type == "response.failed" || evt.Type == "response.incomplete" {
 			evtResp := evt.Response
 			if evtResp.ID != "" {

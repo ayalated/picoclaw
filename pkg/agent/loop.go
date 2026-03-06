@@ -63,6 +63,89 @@ type processOptions struct {
 
 const defaultResponse = "I've completed processing but have no response to give. Increase `max_tool_iterations` in config.json."
 
+const (
+	telegramStreamEditInterval = 800 * time.Millisecond
+	telegramMaxMessageRunes    = 4096
+)
+
+type streamingMessageUpdater struct {
+	ctx       context.Context
+	cm        *channels.Manager
+	channel   string
+	chatID    string
+	interval  time.Duration
+	maxRunes  int
+	mu        sync.Mutex
+	buffer    strings.Builder
+	lastEdit  time.Time
+	hasEdited bool
+	enabled   bool
+}
+
+func newStreamingMessageUpdater(ctx context.Context, cm *channels.Manager, channel, chatID string) *streamingMessageUpdater {
+	if cm == nil || channel == "" || chatID == "" {
+		return nil
+	}
+	if _, ok := cm.PeekPlaceholderID(channel, chatID); !ok {
+		return nil
+	}
+	return &streamingMessageUpdater{
+		ctx:      ctx,
+		cm:       cm,
+		channel:  channel,
+		chatID:   chatID,
+		interval: telegramStreamEditInterval,
+		maxRunes: telegramMaxMessageRunes,
+		enabled:  true,
+	}
+}
+
+func (u *streamingMessageUpdater) Reset() {
+	if u == nil {
+		return
+	}
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.buffer.Reset()
+	u.lastEdit = time.Time{}
+	u.hasEdited = false
+}
+
+func (u *streamingMessageUpdater) OnDelta(delta string) {
+	if u == nil || !u.enabled || delta == "" {
+		return
+	}
+
+	u.mu.Lock()
+	u.buffer.WriteString(delta)
+	content := truncateRunesToLimit(u.buffer.String(), u.maxRunes)
+	if !u.hasEdited || time.Since(u.lastEdit) >= u.interval {
+		u.lastEdit = time.Now()
+		u.hasEdited = true
+		u.mu.Unlock()
+		if err := u.cm.EditPlaceholder(u.ctx, u.channel, u.chatID, content); err != nil {
+			logger.DebugCF("agent", "Failed to edit placeholder during streaming", map[string]any{
+				"channel": u.channel,
+				"chat_id": u.chatID,
+				"error":   err.Error(),
+			})
+		}
+		return
+	}
+	u.mu.Unlock()
+}
+
+func truncateRunesToLimit(s string, limit int) string {
+	if limit <= 0 || s == "" {
+		return ""
+	}
+	r := []rune(s)
+	if len(r) <= limit {
+		return s
+	}
+	return string(r[:limit])
+}
+
 func NewAgentLoop(
 	cfg *config.Config,
 	msgBus *bus.MessageBus,
@@ -878,13 +961,24 @@ func (al *AgentLoop) runLLMIteration(
 			}
 		}
 
+		streamUpdater := newStreamingMessageUpdater(ctx, al.channelManager, opts.Channel, opts.ChatID)
+
 		callLLM := func() (*providers.LLMResponse, error) {
+			chatWithModel := func(ctx context.Context, model string) (*providers.LLMResponse, error) {
+				if streamUpdater != nil {
+					if sp, ok := agent.Provider.(providers.StreamingProvider); ok {
+						return sp.ChatStream(ctx, messages, providerToolDefs, model, llmOpts, streamUpdater.OnDelta)
+					}
+				}
+				return agent.Provider.Chat(ctx, messages, providerToolDefs, model, llmOpts)
+			}
+
 			if len(agent.Candidates) > 1 && al.fallback != nil {
 				fbResult, fbErr := al.fallback.Execute(
 					ctx,
 					agent.Candidates,
 					func(ctx context.Context, provider, model string) (*providers.LLMResponse, error) {
-						return agent.Provider.Chat(ctx, messages, providerToolDefs, model, llmOpts)
+						return chatWithModel(ctx, model)
 					},
 				)
 				if fbErr != nil {
@@ -900,12 +994,15 @@ func (al *AgentLoop) runLLMIteration(
 				}
 				return fbResult.Response, nil
 			}
-			return agent.Provider.Chat(ctx, messages, providerToolDefs, agent.Model, llmOpts)
+			return chatWithModel(ctx, agent.Model)
 		}
 
 		// Retry loop for context/token errors
 		maxRetries := 2
 		for retry := 0; retry <= maxRetries; retry++ {
+			if streamUpdater != nil {
+				streamUpdater.Reset()
+			}
 			response, err = callLLM()
 			if err == nil {
 				break

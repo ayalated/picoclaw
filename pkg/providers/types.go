@@ -32,6 +32,23 @@ type LLMProvider interface {
 	GetDefaultModel() string
 }
 
+// StreamHandler receives incremental text deltas emitted by a streaming provider.
+type StreamHandler func(delta string)
+
+// StreamingProvider is an optional provider interface that exposes token/delta
+// streaming while still returning the final parsed LLMResponse.
+type StreamingProvider interface {
+	LLMProvider
+	ChatStream(
+		ctx context.Context,
+		messages []Message,
+		tools []ToolDefinition,
+		model string,
+		options map[string]any,
+		onDelta StreamHandler,
+	) (*LLMResponse, error)
+}
+
 type StatefulProvider interface {
 	LLMProvider
 	Close()
