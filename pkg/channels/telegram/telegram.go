@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/mymmrac/telego"
 	th "github.com/mymmrac/telego/telegohandler"
@@ -23,6 +24,12 @@ import (
 	"github.com/sipeed/picoclaw/pkg/logger"
 	"github.com/sipeed/picoclaw/pkg/media"
 	"github.com/sipeed/picoclaw/pkg/utils"
+)
+
+const (
+	telegramMaxMessageLength = 4096
+	telegramEditInterval     = 800 * time.Millisecond
+	telegramStreamChunkRunes = 120
 )
 
 var (
@@ -292,9 +299,62 @@ func (c *TelegramChannel) EditMessage(ctx context.Context, chatID string, messag
 	if err != nil {
 		return err
 	}
+
+	content = truncateRunes(content, telegramMaxMessageLength)
+
+	// Simulate streaming in Telegram by editing the same message periodically.
+	if utf8.RuneCountInString(content) <= telegramStreamChunkRunes {
+		return c.editTelegramMessage(ctx, cid, mid, content)
+	}
+
+	var lastSent string
+	ticker := time.NewTicker(telegramEditInterval)
+	defer ticker.Stop()
+
+	for n := telegramStreamChunkRunes; n < utf8.RuneCountInString(content); n += telegramStreamChunkRunes {
+		partial := truncateRunes(content, n)
+		if partial == lastSent {
+			continue
+		}
+		if err := c.editTelegramMessage(ctx, cid, mid, partial); err != nil {
+			logger.WarnCF("telegram", "Failed to stream edit message chunk", map[string]any{
+				"error": err.Error(),
+			})
+			break
+		}
+		lastSent = partial
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
+
+	if content != lastSent {
+		if err := c.editTelegramMessage(ctx, cid, mid, content); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (c *TelegramChannel) editTelegramMessage(ctx context.Context, chatID int64, messageID int, content string) error {
 	htmlContent := markdownToTelegramHTML(content)
-	editMsg := tu.EditMessageText(tu.ID(cid), mid, htmlContent)
+	editMsg := tu.EditMessageText(tu.ID(chatID), messageID, htmlContent)
 	editMsg.ParseMode = telego.ModeHTML
+	_, err := c.bot.EditMessageText(ctx, editMsg)
+	if err == nil {
+		return nil
+	}
+
+	logger.ErrorCF("telegram", "HTML parse failed on message edit, falling back to plain text", map[string]any{
+		"error": err.Error(),
+	})
+
+	editMsg = tu.EditMessageText(tu.ID(chatID), messageID, content)
+	editMsg.ParseMode = ""
 	_, err = c.bot.EditMessageText(ctx, editMsg)
 	return err
 }
@@ -310,7 +370,7 @@ func (c *TelegramChannel) SendPlaceholder(ctx context.Context, chatID string) (s
 
 	text := phCfg.Text
 	if text == "" {
-		text = "Thinking... 💭"
+		text = "🤔 Thinking..."
 	}
 
 	cid, err := parseChatID(chatID)
@@ -612,6 +672,17 @@ func parseChatID(chatIDStr string) (int64, error) {
 	var id int64
 	_, err := fmt.Sscanf(chatIDStr, "%d", &id)
 	return id, err
+}
+
+func truncateRunes(s string, n int) string {
+	if n <= 0 || s == "" {
+		return ""
+	}
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n])
 }
 
 func markdownToTelegramHTML(text string) string {
