@@ -878,9 +878,10 @@ func (al *AgentLoop) runLLMIteration(
 	streamProvider, providerCanStream := agent.Provider.(providers.StreamingProvider)
 	var streamer bus.Streamer
 	if providerCanStream && !opts.NoHistory && !constants.IsInternalChannel(opts.Channel) {
+		logger.Info("STREAMING MODE ENABLED")
 		streamer, _ = al.bus.GetStreamer(ctx, opts.Channel, opts.ChatID)
 	}
-
+	logger.Info("STREAMING MODE NOT SUPPORTED")
 	// Determine effective model tier for this conversation turn.
 	// selectCandidates evaluates routing once and the decision is sticky for
 	// all tool-follow-up iterations within the same turn so that a multi-step
