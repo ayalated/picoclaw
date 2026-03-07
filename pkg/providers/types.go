@@ -20,6 +20,16 @@ type (
 	ContentBlock           = protocoltypes.ContentBlock
 	CacheControl           = protocoltypes.CacheControl
 )
+type StreamingProvider interface {
+	ChatStream(
+		ctx context.Context,
+		messages []Message,
+		tools []ToolDefinition,
+		model string,
+		options map[string]any,
+		onChunk func(accumulated string),
+	) (*LLMResponse, error)
+}
 
 type LLMProvider interface {
 	Chat(

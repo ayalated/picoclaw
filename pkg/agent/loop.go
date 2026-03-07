@@ -875,6 +875,12 @@ func (al *AgentLoop) runLLMIteration(
 	iteration := 0
 	var finalContent string
 
+	streamProvider, providerCanStream := agent.Provider.(providers.StreamingProvider)
+	var streamer bus.Streamer
+	if providerCanStream && !opts.NoHistory && !constants.IsInternalChannel(opts.Channel) {
+		streamer, _ = al.bus.GetStreamer(ctx, opts.Channel, opts.ChatID)
+	}
+
 	// Determine effective model tier for this conversation turn.
 	// selectCandidates evaluates routing once and the decision is sticky for
 	// all tool-follow-up iterations within the same turn so that a multi-step
@@ -936,6 +942,16 @@ func (al *AgentLoop) runLLMIteration(
 		}
 
 		callLLM := func() (*providers.LLMResponse, error) {
+			// Use streaming when available (streamer obtained, provider supports it)
+			if streamer != nil && streamProvider != nil {
+				return streamProvider.ChatStream(
+					ctx, messages, providerToolDefs, activeModel, llmOpts,
+					func(accumulated string) {
+						streamer.Update(ctx, accumulated)
+					},
+				)
+			}
+
 			if len(activeCandidates) > 1 && al.fallback != nil {
 				fbResult, fbErr := al.fallback.Execute(
 					ctx,
@@ -1059,13 +1075,28 @@ func (al *AgentLoop) runLLMIteration(
 		// Check if no tool calls - we're done
 		if len(response.ToolCalls) == 0 {
 			finalContent = response.Content
+			// If we were streaming, finalize the message (sends the permanent message)
+			if streamer != nil {
+				if err := streamer.Finalize(ctx, finalContent); err != nil {
+					logger.WarnCF("agent", "Stream finalize failed", map[string]any{
+						"error": err.Error(),
+					})
+				}
+			}
+
 			logger.InfoCF("agent", "LLM response without tool calls (direct answer)",
 				map[string]any{
 					"agent_id":      agent.ID,
 					"iteration":     iteration,
 					"content_chars": len(finalContent),
+					"streamed":      streamer != nil,
 				})
 			break
+		}
+
+		// Tool calls detected — cancel any active stream (draft auto-expires)
+		if streamer != nil {
+			streamer.Cancel(ctx)
 		}
 
 		normalizedToolCalls := make([]providers.ToolCall, 0, len(response.ToolCalls))

@@ -90,6 +90,7 @@ type BaseChannel struct {
 	placeholderRecorder PlaceholderRecorder
 	owner               Channel // the concrete channel that embeds this BaseChannel
 	reasoningChannelID  string
+	Streaming           bool `json:"streaming"` // 是否启用流式响应，默认 false
 }
 
 func NewBaseChannel(

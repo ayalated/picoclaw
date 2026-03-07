@@ -56,8 +56,9 @@ func DefaultConfig() *Config {
 				Typing:    TypingConfig{Enabled: true},
 				Placeholder: PlaceholderConfig{
 					Enabled: true,
-					Text:    "Thinking... 💭",
+					Text:    "🤔 Thinking...",
 				},
+				Streaming: StreamingConfig{Enabled: true, ThrottleSeconds: 3, MinGrowthChars: 200},
 			},
 			Feishu: FeishuConfig{
 				Enabled:           false,
