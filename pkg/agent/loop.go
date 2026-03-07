@@ -236,7 +236,7 @@ func registerSharedTools(
 }
 
 func (al *AgentLoop) Run(ctx context.Context) error {
-	logger.Info("PICOCLOW CUSTOM BUILD: streaming test build active")
+	fmt.Println("PICOCLOW CUSTOM BUILD: streaming test build active")
 	al.running.Store(true)
 
 	// Initialize MCP servers for all agents
