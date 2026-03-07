@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/sipeed/picoclaw/pkg/logger"
 	"github.com/spf13/cobra"
 
 	"github.com/sipeed/picoclaw/cmd/picoclaw/internal"
@@ -62,6 +63,7 @@ const (
 )
 
 func main() {
+	logger.Info("PICOCLAW Version " + internal.GetVersion())
 	fmt.Printf("%s", banner)
 	cmd := NewPicoclawCommand()
 	if err := cmd.Execute(); err != nil {
